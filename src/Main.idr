@@ -215,4 +215,6 @@ main : IO ()
 main = do
   dbPath <- getEnv "SQLTEST_DB_PATH"
   args   <- getArgs
-  runCommand (fromMaybe ".todo-db" dbPath) args
+  case args of
+    _ :: args => runCommand (fromMaybe ".todo-db" dbPath) args
+    _         => runCommand (fromMaybe ".todo-db" dbPath) []
