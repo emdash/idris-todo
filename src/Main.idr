@@ -1,6 +1,4 @@
 ||| Example TodoList CLI application using sqlite3
-|||
-
 module Main
 
 import System
@@ -81,7 +79,32 @@ createDependencies =
 
 
 -------------------------------------------------------------------------------
--- SQL Commands and Queries
+-- SQL Queries
+-------------------------------------------------------------------------------
+
+
+||| list all tasks
+tasks : Query (WithID $ Task)
+tasks = SELECT
+  ["t.id", "t.description", "t.status"]
+  [< FROM (Tasks `AS` "t")]
+  `ORDER_BY` [ASC "t.id"]
+
+||| list only new tasks
+inbox : Query (WithID $ Task)
+inbox = tasks `WHERE` ("t.status" `IS` val New)
+
+||| list all incomplete tasks
+incomplete : Query (WithID $ Task)
+incomplete = tasks `WHERE` ("t.status" `IS_NOT` val Completed)
+
+||| show completed tasks
+completed : Query (WithID $ Task)
+completed = tasks `WHERE` ("t.status" `IN` [val Completed, val Dropped])
+
+
+-------------------------------------------------------------------------------
+-- SQL Commands
 -------------------------------------------------------------------------------
 
 
@@ -104,25 +127,6 @@ dependsOn x y = INSERT Dependencies ["task", "dependency"] [val x, val y]
 ||| purge completed tasks
 deleteCompleted : Cmd TDelete
 deleteCompleted = DELETE Tasks ("status" `IN` [val Completed, val Dropped])
-
-||| list all tasks
-tasks : Query (WithID $ Task)
-tasks = SELECT
-  ["t.id", "t.description", "t.status"]
-  [< FROM (Tasks `AS` "t")]
-  `ORDER_BY` [ASC "t.id"]
-
-||| list only new tasks
-inbox : Query (WithID $ Task)
-inbox = tasks `WHERE` ("t.status" `IS` val New)
-
-||| list all incomplete tasks
-incomplete : Query (WithID $ Task)
-incomplete = tasks `WHERE` ("t.status" `IS_NOT` val Completed)
-
-||| show completed tasks
-completed : Query (WithID $ Task)
-completed = tasks `WHERE` ("t.status" `IN` [val Completed, val Dropped])
 
 
 -------------------------------------------------------------------------------
@@ -152,7 +156,7 @@ data Command
 parseId : String -> Maybe Bits32
 parseId id = case stringToNatOrZ id of
   Z => Nothing
-  x => Just $ cast x
+  x => if x <= 0xFFFFFFFF then Just $ cast x else Nothing
 
 
 ||| Parse an argument vector into an application command
@@ -200,11 +204,13 @@ app path args = withDB path $ do
     Just Purge          => cmds $ [ deleteCompleted ]
 
 
+||| helper function for debugging in the repl
 runCommand : String -> List String -> IO ()
 runCommand path args = do
   runApp handlers $ app path args
 
 
+||| main entry point which configures from environment and argv
 main : IO ()
 main = do
   dbPath <- getEnv "SQLTEST_DB_PATH"
