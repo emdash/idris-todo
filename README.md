@@ -1,6 +1,6 @@
 # An Idris Sqlite3 Example
 
-This is a command-line todolsit application which demonstrates the use
+This is a command-line todolist application which demonstrates the use
 of [idris2-sqlite3](https://github.com/stefan-hoeck/idris2-sqlite3/tree/main)
 
 Still a work in progress.
