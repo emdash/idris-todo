@@ -1,8 +1,16 @@
 ||| Example TodoList CLI application using sqlite3
+|||
+||| This goes beyond the usual flat todo-list to allow the user to
+||| organize items into projects, express dependencies between tasks,
+||| and then view them hierarchically.
+|||
+||| The GTD concepts of "projects" and "next actions" are directly
+||| supported.
 module Main
 
 import System
 import Data.WithID
+import Data.SortedSet
 import Derive.Sqlite3
 import Control.RIO.Sqlite3
 
@@ -17,8 +25,7 @@ import Control.RIO.Sqlite3
 
 ||| High-level type for task status
 data Status
-  = New
-  | Incomplete
+  = Incomplete
   | Completed
   | Dropped
 %runElab derive "Status" [Show, Eq, ToCell, FromCell]
@@ -27,8 +34,8 @@ data Status
 ||| High-level type for task
 record Task where
   constructor T
-  name    : String
-  status  : Status
+  description : String
+  status      : Status
 %runElab derive "Task" [Show, Eq, ToRow, FromRow]
 
 
@@ -58,8 +65,8 @@ createTasks =
 
 
 ||| This table tracks dependencies between tasks.
-Dependencies : SQLTable
-Dependencies =
+DependsOn : SQLTable
+DependsOn =
   table "dependencies"
     [ C "id"          INTEGER
     , C "task"        INTEGER
@@ -68,9 +75,9 @@ Dependencies =
 
 
 ||| Database command to create the dependencies table
-createDependencies : Cmd TCreate
-createDependencies =
-  IF_NOT_EXISTS $ CREATE_TABLE Dependencies
+createDependsOn : Cmd TCreate
+createDependsOn =
+  IF_NOT_EXISTS $ CREATE_TABLE DependsOn
     [ PRIMARY_KEY       ["id"]
     , AUTOINCREMENT     "id"
     , FOREIGN_KEY Tasks ["task"]        ["id"]
@@ -83,24 +90,70 @@ createDependencies =
 -------------------------------------------------------------------------------
 
 
-||| list all tasks
+||| fetch all tasks in the database
 tasks : Query (WithID $ Task)
 tasks = SELECT
   ["t.id", "t.description", "t.status"]
   [< FROM (Tasks `AS` "t")]
   `ORDER_BY` [ASC "t.id"]
 
-||| list only new tasks
-inbox : Query (WithID $ Task)
-inbox = tasks `WHERE` ("t.status" `IS` val New)
 
-||| list all incomplete tasks
+||| fetch all task IDs from the database
+taskIds : Query Bits32
+taskIds = SELECT
+  ["t.id"]
+  [< FROM (Tasks `AS` "t")]
+  `ORDER_BY` [ASC "t.id"]
+
+
+||| fetch a set of tasks from a list of task ids
+byIds : List Bits32 -> Query (WithID $ Task)
+byIds ids = tasks `WHERE` ("t.id" `IN` map val ids)
+
+
+||| fetch all incomplete tasks
 incomplete : Query (WithID $ Task)
-incomplete = tasks `WHERE` ("t.status" `IS_NOT` val Completed)
+incomplete = tasks `WHERE` ("t.status" `IS` val Incomplete)
 
-||| show completed tasks
+
+||| fetch all completed or dropped tasks
 completed : Query (WithID $ Task)
 completed = tasks `WHERE` ("t.status" `IN` [val Completed, val Dropped])
+
+
+||| fetch all dependencies of the given task
+deps : Bits32 -> Query (WithID $ Task)
+deps id = SELECT
+  ["t.id", "t.description", "t.status"]
+  [< FROM (DependsOn `AS` "d")
+  ,  JOIN (Tasks `AS` "t") `ON` ("d.dependency" == "t.id")
+  ]
+  `WHERE` ("d.task" == val id)
+
+
+||| fetch ids of all tasks which have active dependencies
+|||
+||| this is a "project" in gtd parlance
+|||
+||| XXX: Ideally I'd use `SELECT_DISTINCT`, but this isn't implemented
+||| yet, so we just return the entire task column.
+projectIds : Query Bits32
+projectIds = SELECT
+  ["d.task"]
+  [< FROM (DependsOn `AS` "d")
+  ,  JOIN (Tasks `AS` "t") `ON` ("d.dependency" == "t.id")
+  ]
+  `WHERE` ("t.status" == val Incomplete)
+
+
+||| fetch ids of active tasks which are dependencies of at least one other task.
+subtaskIds : Query Bits32
+subtaskIds = SELECT
+  ["d.dependency"]
+  [< FROM (DependsOn `AS` "d")
+   , JOIN (Tasks `AS` "t") `ON` ("d.dependency" == "t.id")
+  ]
+  `WHERE` ("t.status" == val Incomplete)
 
 
 -------------------------------------------------------------------------------
@@ -112,21 +165,32 @@ completed = tasks `WHERE` ("t.status" `IN` [val Completed, val Dropped])
 insertTask : Task -> Cmd TInsert
 insertTask = insert Tasks ["description", "status"]
 
+
 ||| drop a task by its id
 dropTask : Bits32 -> Cmd TUpdate
 dropTask id = UPDATE Tasks ["status" .= Dropped] ("id" == val id)
+
 
 ||| complete a task by id
 completeTask : Bits32 -> Cmd TUpdate
 completeTask id = UPDATE Tasks ["status" .= Completed] ("id" == val id)
 
+
 ||| make one task depend on another
-dependsOn : Bits32 -> Bits32 -> Cmd TInsert
-dependsOn x y = INSERT Dependencies ["task", "dependency"] [val x, val y]
+depends : Bits32 -> Bits32 -> Cmd TInsert
+depends task dep = INSERT DependsOn ["task", "dependency"] [val task, val dep]
+
 
 ||| purge completed tasks
 deleteCompleted : Cmd TDelete
 deleteCompleted = DELETE Tasks ("status" `IN` [val Completed, val Dropped])
+
+
+||| delete any deges which are connected to any of the given nodes
+deleteDeps : List Bits32 -> Cmd TDelete
+deleteDeps ids =
+  let ids = map val ids
+  in DELETE DependsOn (("task" `IN` ids) || ("dependency" `IN` ids))
 
 
 -------------------------------------------------------------------------------
@@ -141,7 +205,10 @@ data Command
   | ShowInbox
   | ShowIncomplete
   | ShowCompleted
-  | ShowDepGraph
+  | ShowProjects
+  | ShowNext
+  | ShowDeps     Bits32
+  | ShowTree     Bits32
   -- commands
   | Add          String
   | Drop         Bits32
@@ -161,18 +228,21 @@ parseId id = case stringToNatOrZ id of
 
 ||| Parse an argument vector into an application command
 parse : List String -> Maybe Command
-parse []               = Just $ ShowIncomplete
-parse ["all"]          = Just $ ShowAll
-parse ["inbox"]        = Just $ ShowInbox
-parse ["completed"]    = Just $ ShowCompleted
-parse ["incomplete"]   = Just $ ShowIncomplete
-parse ["deps"]         = Just $ ShowDepGraph
-parse ("add" :: rest)  = Just $ Add       (unwords rest)
-parse ["complete", id] = Just $ Complete !(parseId id)
-parse ["drop",     id] = Just $ Drop     !(parseId id)
-parse ["depend", t, d] = Just $ Depend   !(parseId t)    !(parseId d)
-parse ["purge"]        = Just $ Purge
-parse _                = Nothing
+parse []                = Just $ ShowNext
+parse ["all"]           = Just $ ShowAll
+parse ["inbox"]         = Just $ ShowInbox
+parse ["completed"]     = Just $ ShowCompleted
+parse ["incomplete"]    = Just $ ShowIncomplete
+parse ["projects"]      = Just $ ShowProjects
+parse ["next"]          = Just $ ShowNext
+parse ["deps", id]      = Just $ ShowDeps !(parseId id)
+parse ["tree", id]      = Just $ ShowTree !(parseId id)
+parse ("add" :: rest)   = Just $ Add       (unwords rest)
+parse ["complete", id]  = Just $ Complete !(parseId id)
+parse ["drop",     id]  = Just $ Drop     !(parseId id)
+parse ["depends", t, d] = Just $ Depend   !(parseId t)    !(parseId d)
+parse ["purge"]         = Just $ Purge
+parse _                 = Nothing
 
 
 -------------------------------------------------------------------------------
@@ -180,28 +250,109 @@ parse _                = Nothing
 -------------------------------------------------------------------------------
 
 
+||| Maximum number of results for any single query
+MAX_RESULTS : Nat
+MAX_RESULTS = 10000
+
+
+||| Declare the list of errors we handle
 0 Errs : List Type
 Errs = [SqlError]
 
+
+||| Handle errors by printing them
 handlers : All (Handler ()) Errs
 handlers = [ printLn ]
+
+
+||| Deduplicate a list of values
+dedup : Ord a => Eq a => List a -> List a
+dedup xs = SortedSet.toList $ the (SortedSet a) $ fromList xs
+
+
+||| Query the set of tasks which have dependencies
+|||
+||| XXX: Not sure how to express this as a single query.
+projects : DB => App Errs (Table $ WithID Task)
+projects = do
+  withDups <- query projectIds MAX_RESULTS
+  queryTable (byIds $ dedup withDups) MAX_RESULTS
+
+
+||| Query the set of tasks which have no dependencies.
+|||
+||| These are referred to as "next actions" in gtd parlance.
+|||
+||| XXX: Not sure how to express this as a single query.
+nextActions : DB => App Errs (Table $ WithID Task)
+nextActions = do
+  all   <- query taskIds     MAX_RESULTS
+  projs <- query projectIds  MAX_RESULTS
+  let all   = SortedSet.fromList all
+  let projs = SortedSet.fromList projs
+  let diff  = SortedSet.toList $ all `difference` projs
+  queryTable (byIds diff) MAX_RESULTS
+
+
+||| Query the set of tasks disconnected tasks
+|||
+||| XXX: Not sure how to express this as a single query.
+inbox : DB => App Errs (Table $ WithID Task)
+inbox = do
+  all   <- query taskIds    MAX_RESULTS
+  projs <- query projectIds MAX_RESULTS
+  deps  <- query subtaskIds MAX_RESULTS
+  let all   = SortedSet.fromList all
+  let projs = SortedSet.fromList projs
+  let deps  = SortedSet.fromList deps
+  let res   = SortedSet.toList $ all `difference` (projs `union` deps)
+  queryTable (byIds res) MAX_RESULTS
+
+
+||| Remove tasks and dependency edges which are completed or dropped.
+purge : DB => App Errs ()
+purge = do
+  complete <- query completed MAX_RESULTS
+  cmds $ [ deleteDeps $ map (.id) complete, deleteCompleted ]
+
+
+||| Display a tree expansion of the task graph rooted at the given node.
+tree : DB => Nat -> Nat -> Bits32 -> App Errs ()
+tree Z d _ = printLn $ indent (d * 4) "Max Recursion Depth Exceeded"
+tree (S max_depth) depth id = do
+  result <- query (byIds [id]) MAX_RESULTS
+  case result of
+    [task] => putStrLn $ "\{padLeft 4 ' ' $ show task.id} | \{indent (depth * 4) $ format task.value}"
+    x      => die "expected single result, got \{show x}"
+  deps <- query (deps id) MAX_RESULTS
+  for_ deps $ \child => do
+    tree max_depth (depth + 1) child.id
+  where
+    format : Task -> String
+    format (T description Incomplete) = "- \{description}"
+    format (T description Completed)  = "+ \{description}"
+    format (T description Dropped)    = "o \{description}"
+
 
 ||| Dispatch application commands to the database.
 app: String -> List String -> App Errs ()
 app path args = withDB path $ do
-  cmds $ [createTasks, createDependencies]
+  cmds $ [createTasks, createDependsOn]
   case parse args of
     Nothing => die "Invalid command: \{unwords args}"
-    Just ShowAll        => queryTable tasks      10000 >>= printTable
-    Just ShowInbox      => queryTable inbox      10000 >>= printTable
-    Just ShowCompleted  => queryTable completed  10000 >>= printTable
-    Just ShowIncomplete => queryTable incomplete 10000 >>= printTable
-    Just ShowDepGraph   => ?hole_6
-    Just (Add desc)     => cmds $ [ insertTask $ T desc New ]
+    Just ShowAll        => queryTable tasks      MAX_RESULTS >>= printTable
+    Just ShowInbox      => inbox                             >>= printTable
+    Just ShowCompleted  => queryTable completed  MAX_RESULTS >>= printTable
+    Just ShowIncomplete => queryTable incomplete MAX_RESULTS >>= printTable
+    Just ShowProjects   => projects                          >>= printTable
+    Just ShowNext       => nextActions                       >>= printTable
+    Just (ShowDeps id)  => queryTable (deps id)  MAX_RESULTS >>= printTable
+    Just (ShowTree id)  => tree 100 0 id
+    Just (Add desc)     => cmds $ [ insertTask $ T desc Incomplete ]
     Just (Drop id)      => cmds $ [ dropTask id ]
     Just (Complete id)  => cmds $ [ completeTask id ]
-    Just (Depend t d)   => cmds $ [ dependsOn t d ]
-    Just Purge          => cmds $ [ deleteCompleted ]
+    Just (Depend t d)   => cmds $ [ depends t d ]
+    Just Purge          => purge
 
 
 ||| helper function for debugging in the repl
