@@ -252,7 +252,7 @@ t.id | t.description |  t.status
 ## Command Summary
 
 
-| Command                 | Summary                               |
+| Query                   | Summary                               |
 |-------------------------|---------------------------------------|
 | *empty command line*    | defaults to `next`                    |
 | `all`                   | show all tasks, regardless of status  |
@@ -263,6 +263,8 @@ t.id | t.description |  t.status
 | `next`                  | show tasks with no dependencies       |
 | `deps`                  | show the direct subtasks of a project |
 | `tree <id>`             | show the tree expansion rooded at <id>|
+
+| Command                 |                                       |
 |-------------------------|---------------------------------------|
 | `add ...`               | creates a new task                    |
 | `drop <id>`             | mark task as "dropped"                |
