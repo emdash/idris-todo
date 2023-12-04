@@ -262,6 +262,7 @@ t.id | t.description |  t.status
 | `projects`              | show tasks which have subtasks        |
 | `next`                  | show tasks with no dependencies       |
 | `deps`                  | show the direct subtasks of a project |
+| `tree <id>`             | show the tree expansion rooded at <id>|
 |-------------------------|---------------------------------------|
 | `add ...`               | creates a new task                    |
 | `drop <id>`             | mark task as "dropped"                |
