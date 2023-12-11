@@ -65,23 +65,30 @@ createTasks =
 
 
 ||| This table tracks dependencies between tasks.
+|||
+||| Entries in this table are unique: i.e. duplicate dependencies are
+||| ignored. This is why there is no ID field.
 DependsOn : SQLTable
 DependsOn =
   table "dependencies"
-    [ C "id"          INTEGER
-    , C "task"        INTEGER
+    [ C "task"        INTEGER
     , C "dependency"  INTEGER
     ]
 
 
 ||| Database command to create the dependencies table
+|||
+||| Note: The primary key of this is a *pair* of columns, which
+||| enforces that dependency relations are unique for each pair of
+||| tasks.
 createDependsOn : Cmd TCreate
 createDependsOn =
   IF_NOT_EXISTS $ CREATE_TABLE DependsOn
-    [ PRIMARY_KEY       ["id"]
-    , AUTOINCREMENT     "id"
+    [ PRIMARY_KEY       ["task", "dependency"]
     , FOREIGN_KEY Tasks ["task"]        ["id"]
     , FOREIGN_KEY Tasks ["dependency"]  ["id"]
+    , NOT_NULL "task"
+    , NOT_NULL "dependency"
     ]
 
 
@@ -90,15 +97,15 @@ createDependsOn =
 -------------------------------------------------------------------------------
 
 
-||| fetch all tasks in the database
-tasks : Query (WithID $ Task)
+||| Fetch all tasks in the database.
+tasks : Query (WithID Task)
 tasks = SELECT
   ["t.id", "t.description", "t.status"]
   [< FROM (Tasks `AS` "t")]
   `ORDER_BY` [ASC "t.id"]
 
 
-||| fetch all task IDs from the database
+||| Fetch all task IDs from the database.
 taskIds : Query Bits32
 taskIds = SELECT
   ["t.id"]
@@ -106,23 +113,23 @@ taskIds = SELECT
   `ORDER_BY` [ASC "t.id"]
 
 
-||| fetch a set of tasks from a list of task ids
-byIds : List Bits32 -> Query (WithID $ Task)
+||| Fetch a set of tasks from a list of task ids.
+byIds : List Bits32 -> Query (WithID Task)
 byIds ids = tasks `WHERE` ("t.id" `IN` map val ids)
 
 
-||| fetch all incomplete tasks
-incomplete : Query (WithID $ Task)
+||| Fetch all incomplete tasks from the database.
+incomplete : Query (WithID Task)
 incomplete = tasks `WHERE` ("t.status" `IS` val Incomplete)
 
 
-||| fetch all completed or dropped tasks
-completed : Query (WithID $ Task)
+||| Fetch all completed tasks from the database.
+completed : Query (WithID Task)
 completed = tasks `WHERE` ("t.status" `IN` [val Completed, val Dropped])
 
 
-||| fetch all dependencies of the given task
-deps : Bits32 -> Query (WithID $ Task)
+||| Fetch all dependencies of the given task.
+deps : Bits32 -> Query (WithID Task)
 deps id = SELECT
   ["t.id", "t.description", "t.status"]
   [< FROM (DependsOn `AS` "d")
@@ -131,22 +138,22 @@ deps id = SELECT
   `WHERE` ("d.task" == val id)
 
 
-||| fetch ids of all tasks which have active dependencies
-|||
-||| this is a "project" in gtd parlance
-|||
-||| XXX: Ideally I'd use `SELECT_DISTINCT`, but this isn't implemented
-||| yet, so we just return the entire task column.
-projectIds : Query Bits32
-projectIds = SELECT
-  ["d.task"]
+||| Fetch all tasks with at least one dependency.
+projects : Query (WithID Task)
+projects = SELECT
+  ["t.id", "t.description", "t.status"]
   [< FROM (DependsOn `AS` "d")
-  ,  JOIN (Tasks `AS` "t") `ON` ("d.dependency" == "t.id")
+  ,  JOIN (Tasks `AS` "t") `ON` ("d.task" == "t.id")
   ]
   `WHERE` ("t.status" == val Incomplete)
+  `GROUP_BY` ["t.id"]
 
 
-||| fetch ids of active tasks which are dependencies of at least one other task.
+||| Fetch all tasks IDs which are dependencies of at least one task.
+|||
+||| Note: This is not directly useful as a user-facing query, but is
+||| used by the `inbox` function to calculate the set of tasks which
+||| are disjoint from the dependency graph.
 subtaskIds : Query Bits32
 subtaskIds = SELECT
   ["d.dependency"]
@@ -154,6 +161,7 @@ subtaskIds = SELECT
    , JOIN (Tasks `AS` "t") `ON` ("d.dependency" == "t.id")
   ]
   `WHERE` ("t.status" == val Incomplete)
+  `GROUP_BY` ["t.id"]
 
 
 -------------------------------------------------------------------------------
@@ -161,32 +169,34 @@ subtaskIds = SELECT
 -------------------------------------------------------------------------------
 
 
-||| add a new task
+||| Add a new task.
 insertTask : Task -> Cmd TInsert
 insertTask = insert Tasks ["description", "status"]
 
 
-||| drop a task by its id
+||| Mark the given task as Dropped.
 dropTask : Bits32 -> Cmd TUpdate
 dropTask id = UPDATE Tasks ["status" .= Dropped] ("id" == val id)
 
 
-||| complete a task by id
+||| Mark the given task as Completed.
 completeTask : Bits32 -> Cmd TUpdate
 completeTask id = UPDATE Tasks ["status" .= Completed] ("id" == val id)
 
 
-||| make one task depend on another
+||| Add a depdendency between two tasks.
 depends : Bits32 -> Bits32 -> Cmd TInsert
 depends task dep = INSERT DependsOn ["task", "dependency"] [val task, val dep]
 
 
-||| purge completed tasks
+||| Delete completed tasks from the database.
 deleteCompleted : Cmd TDelete
 deleteCompleted = DELETE Tasks ("status" `IN` [val Completed, val Dropped])
 
 
-||| delete any deges which are connected to any of the given nodes
+||| Delete any deges which are connected to any of the given nodes.
+|||
+||| XXX: This might be broken.
 deleteDeps : List Bits32 -> Cmd TDelete
 deleteDeps ids =
   let ids = map val ids
@@ -227,6 +237,9 @@ parseId id = case stringToNatOrZ id of
 
 
 ||| Parse an argument vector into an application command
+|||
+||| Idris has more sophisticated facilities for parsing, but I like
+||| this quick-and-dirty approach for a short script.
 parse : List String -> Maybe Command
 parse []                = Just $ ShowNext
 parse ["all"]           = Just $ ShowAll
@@ -265,45 +278,36 @@ handlers : All (Handler ()) Errs
 handlers = [ printLn ]
 
 
-||| Deduplicate a list of values
-dedup : Ord a => Eq a => List a -> List a
-dedup xs = SortedSet.toList $ the (SortedSet a) $ fromList xs
-
-
-||| Query the set of tasks which have dependencies
-|||
-||| XXX: Not sure how to express this as a single query.
-projects : DB => App Errs (Table $ WithID Task)
-projects = do
-  withDups <- query projectIds MAX_RESULTS
-  queryTable (byIds $ dedup withDups) MAX_RESULTS
-
-
 ||| Query the set of tasks which have no dependencies.
 |||
 ||| These are referred to as "next actions" in gtd parlance.
 |||
-||| XXX: Not sure how to express this as a single query.
+||| XXX: I *believe* that the functionality required to express this
+||| in Idris already exists, but I'm not sure how to express it even
+||| as raw SQL.
 nextActions : DB => App Errs (Table $ WithID Task)
 nextActions = do
-  all   <- query taskIds     MAX_RESULTS
-  projs <- query projectIds  MAX_RESULTS
+  all   <- query taskIds  MAX_RESULTS
+  projs <- query projects MAX_RESULTS
   let all   = SortedSet.fromList all
-  let projs = SortedSet.fromList projs
-  let diff  = SortedSet.toList $ all `difference` projs
+  let projs = SortedSet.fromList $ map (.id) projs
+  let diff  = SortedSet.toList   $ all `difference` projs
   queryTable (byIds diff) MAX_RESULTS
 
 
-||| Query the set of tasks disconnected tasks
+||| Query the set of tasks that are neither projects or subtasks.
 |||
-||| XXX: Not sure how to express this as a single query.
+||| XXX: It's possible to express this as a pure sql query, but the
+||| functionality required is not yet implemented in the library. This
+||| should be converted to a pure query when compound operators become
+||| available.
 inbox : DB => App Errs (Table $ WithID Task)
 inbox = do
   all   <- query taskIds    MAX_RESULTS
-  projs <- query projectIds MAX_RESULTS
+  projs <- query projects   MAX_RESULTS
   deps  <- query subtaskIds MAX_RESULTS
   let all   = SortedSet.fromList all
-  let projs = SortedSet.fromList projs
+  let projs = SortedSet.fromList $ map (.id) projs
   let deps  = SortedSet.fromList deps
   let res   = SortedSet.toList $ all `difference` (projs `union` deps)
   queryTable (byIds res) MAX_RESULTS
@@ -317,8 +321,17 @@ purge = do
 
 
 ||| Display a tree expansion of the task graph rooted at the given node.
+|||
+||| Note: It's possible to express this as a pure sql query, but the
+||| functionality required is not yet implemented in the libary. This
+||| should be converted to a pure query when recursive select become
+||| available.
+|||
+||| From the sqlite3 documentation:
+|||   https://www.sqlite.org/lang_with.html#queries_against_a_graph
+|||   https://www.sqlite.org/lang_with.html#controlling_depth_first_versus_breadth_first_search_of_a_tree_using_order_by
 tree : DB => Nat -> Nat -> Bits32 -> App Errs ()
-tree Z d _ = printLn $ indent (d * 4) "Max Recursion Depth Exceeded"
+tree Z d _ = putStrLn $ "    | " ++ indent (d * 4) "Max Recursion Depth Exceeded"
 tree (S max_depth) depth id = do
   result <- query (byIds [id]) MAX_RESULTS
   case result of
@@ -344,24 +357,24 @@ app path args = withDB path $ do
     Just ShowInbox      => inbox                             >>= printTable
     Just ShowCompleted  => queryTable completed  MAX_RESULTS >>= printTable
     Just ShowIncomplete => queryTable incomplete MAX_RESULTS >>= printTable
-    Just ShowProjects   => projects                          >>= printTable
+    Just ShowProjects   => queryTable projects   MAX_RESULTS >>= printTable
     Just ShowNext       => nextActions                       >>= printTable
     Just (ShowDeps id)  => queryTable (deps id)  MAX_RESULTS >>= printTable
     Just (ShowTree id)  => tree 100 0 id
-    Just (Add desc)     => cmds $ [ insertTask $ T desc Incomplete ]
-    Just (Drop id)      => cmds $ [ dropTask id ]
-    Just (Complete id)  => cmds $ [ completeTask id ]
-    Just (Depend t d)   => cmds $ [ depends t d ]
+    Just (Add desc)     => cmds [ insertTask $ T desc Incomplete ]
+    Just (Drop id)      => cmds [ dropTask id ]
+    Just (Complete id)  => cmds [ completeTask id ]
+    Just (Depend t d)   => cmds [ depends t d ]
     Just Purge          => purge
 
 
-||| helper function for debugging in the repl
+||| A helper function for debugging in the repl.
 runCommand : String -> List String -> IO ()
 runCommand path args = do
   runApp handlers $ app path args
 
 
-||| main entry point which configures from environment and argv
+||| The main entry point which configures from environment and argv.
 main : IO ()
 main = do
   dbPath <- getEnv "SQLTEST_DB_PATH"
