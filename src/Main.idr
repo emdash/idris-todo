@@ -81,6 +81,9 @@ DependsOn =
 ||| Note: The primary key of this is a *pair* of columns, which
 ||| enforces that dependency relations are unique for each pair of
 ||| tasks.
+|||
+||| XXX: add ON_DELETE CASCADE to the foreign keys when it becomes
+||| available upstream.
 createDependsOn : Cmd TCreate
 createDependsOn =
   IF_NOT_EXISTS $ CREATE_TABLE DependsOn
@@ -314,6 +317,11 @@ inbox = do
 
 
 ||| Remove tasks and dependency edges which are completed or dropped.
+|||
+||| XXX: Once foreign key actions land upstream, add `ON_DELETE
+||| CASCADE` to the deps table definition, and this function can go
+||| away (all we need is to DELETE where status == Completed at that
+||| point)
 purge : DB => App Errs ()
 purge = do
   complete <- query completed MAX_RESULTS
